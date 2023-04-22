@@ -242,7 +242,7 @@ impl Board {
         self.grid
             .set(anchor, Tile(Some(a)))
             .expect("primary must be in bounds");
-        let _ = self.grid.set(anchor.shifted(shift), Tile(Some(a)));
+        let _ = self.grid.set(anchor.shifted(shift), Tile(Some(b)));
     }
 
     fn clear_active_pair(&mut self) {

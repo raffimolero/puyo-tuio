@@ -1,17 +1,21 @@
 // TODO: remove this when ready
-#![allow(warnings)]
+// #![allow(warnings)]
 
 use std::{
     array::from_fn,
     collections::{HashSet, VecDeque},
     fmt::Display,
+    io::stdout,
     iter::repeat_with,
     time::{Duration, Instant},
 };
 
 use crossterm::{
+    cursor::MoveTo,
     event::{poll, read, Event, KeyCode, KeyEvent, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    execute,
+    style::Print,
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use rand::prelude::*;
 
@@ -57,6 +61,16 @@ impl Display for Puyo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Tile(Option<Puyo>);
 
+impl Tile {
+    fn is_free(self) -> bool {
+        self.0.is_none()
+    }
+
+    fn is_occupied(self) -> bool {
+        self.0.is_some()
+    }
+}
+
 impl Display for Tile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(puyo) = self.0 {
@@ -68,7 +82,7 @@ impl Display for Tile {
 }
 
 #[derive(Debug)]
-struct Grid([[Tile; 6]; 12]);
+struct Grid([[Tile; Self::WIDTH]; Self::HEIGHT]);
 
 impl Grid {
     const WIDTH: usize = 6;
@@ -78,35 +92,99 @@ impl Grid {
         Self::default()
     }
 
-    fn get(&self, Point { x, y }: Point) -> Option<Tile> {
-        ((0..Self::WIDTH as i8).contains(&x) && (0..Self::HEIGHT as i8).contains(&y))
-            .then(|| self.0[y as usize][x as usize])
+    // /// returns the previous tile state at that position.
+    // /// none if out of bounds.
+    // fn set(&mut self, Point { x, y }: Point, tile: Tile) -> Result<Tile, ()> {
+    //     if !(0..Self::WIDTH as i8).contains(&x) || !(0..Self::HEIGHT as i8).contains(&y) {
+    //         return Err(());
+    //     }
+    //     Ok(std::mem::replace(&mut self.0[y as usize][x as usize], tile))
+    // }
+
+    /// checks if a point is in bounds.
+    fn point_in_bounds(Point { x, y }: Point) -> bool {
+        (0..Self::WIDTH as i8).contains(&x) && (0..Self::HEIGHT as i8).contains(&y)
     }
 
-    /// returns the previous tile state at that position.
-    /// none if out of bounds.
-    fn set(&mut self, Point { x, y }: Point, tile: Tile) -> Result<Tile, ()> {
-        if !(0..Self::WIDTH as i8).contains(&x) || !(0..Self::HEIGHT as i8).contains(&y) {
-            return Err(());
+    fn get(&self, p @ Point { x, y }: Point) -> Option<Tile> {
+        Self::point_in_bounds(p).then(|| self.0[y as usize][x as usize])
+    }
+
+    fn get_mut(&mut self, p @ Point { x, y }: Point) -> Option<&mut Tile> {
+        Self::point_in_bounds(p).then(|| &mut self.0[y as usize][x as usize])
+    }
+
+    /// returns true if spot is in bounds and unoccupied.
+    fn is_free(&self, p: Point) -> bool {
+        self.get(p) == Some(Tile(None))
+    }
+
+    /// returns true if spot is either out of bounds or if a puyo occupies that slot.
+    fn is_occupied(&self, p: Point) -> bool {
+        !self.is_free(p)
+    }
+
+    /// returns true if the space was in bounds and occupied.
+    #[must_use]
+    fn try_remove(&mut self, p: Point) -> bool {
+        let Some(tile) = self.get_mut(p) else {
+            return false;
+        };
+        if tile.is_occupied() {
+            tile.0 = None;
+            true
+        } else {
+            false
         }
-        Ok(std::mem::replace(&mut self.0[y as usize][x as usize], tile))
+    }
+
+    /// attempts to put a puyo in a specified tile.
+    /// returns Ok if the tile was successfully set.
+    #[must_use]
+    fn try_place(&mut self, p: Point, puyo: Puyo) -> bool {
+        let Some(tile) = self.get_mut(p) else {
+            return false;
+        };
+        if tile.is_free() {
+            tile.0 = Some(puyo);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[must_use]
+    fn try_shift(&mut self, bottom: Point) -> bool {
+        if self.is_free(bottom.shifted(Direction::D)) {
+            let col = bottom.x as usize;
+            for y in (0..=bottom.y as usize).rev() {
+                self.0[y + 1][col] = self.0[y][col];
+            }
+            self.0[0][col] = Tile(None);
+            true
+        } else {
+            false
+        }
     }
 }
 
 impl Default for Grid {
     fn default() -> Self {
-        Self([[Tile(None); 6]; 12])
+        Self([[Tile(None); Self::WIDTH]; Self::HEIGHT])
     }
 }
 
 impl Display for Grid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "+{}+", "-".repeat(Self::WIDTH * 3))?;
         for row in &self.0 {
+            write!(f, "|")?;
             for tile in row {
                 write!(f, "{tile}")?;
             }
-            writeln!(f)?;
+            writeln!(f, "|")?;
         }
+        write!(f, "+{}+", "-".repeat(Self::WIDTH * 3))?;
         Ok(())
     }
 }
@@ -155,6 +233,15 @@ impl Direction {
             Direction::L => Direction::D,
         }
     }
+
+    fn rotated_180(self) -> Self {
+        match self {
+            Direction::U => Direction::D,
+            Direction::R => Direction::L,
+            Direction::D => Direction::U,
+            Direction::L => Direction::R,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,8 +251,8 @@ struct Point {
 }
 
 impl Point {
-    fn shifted(mut self, rot: Direction) -> Self {
-        match rot {
+    fn shifted(mut self, shift: Direction) -> Self {
+        match shift {
             Direction::U => self.y -= 1,
             Direction::R => self.x += 1,
             Direction::D => self.y += 1,
@@ -179,6 +266,24 @@ impl Point {
 struct PairPosition {
     anchor: Point,
     shift: Direction,
+}
+
+impl PairPosition {
+    fn pair(&self) -> Point {
+        self.anchor.shifted(self.shift)
+    }
+
+    fn rotate_cw(&mut self) {
+        self.shift = self.shift.rotated_cw();
+    }
+
+    fn rotate_cc(&mut self) {
+        self.shift = self.shift.rotated_cc();
+    }
+
+    fn kickback(&mut self) {
+        self.anchor = self.anchor.shifted(self.shift.rotated_180())
+    }
 }
 
 impl Default for PairPosition {
@@ -215,7 +320,20 @@ impl Board {
         this
     }
 
-    /// returns whether the active puyo locked.
+    fn draw_active_pair(&mut self) {
+        let Pair([a, b]) = self.queue[0];
+        let PairPosition { anchor, shift } = self.active_pair;
+        assert!(self.grid.try_place(anchor, a), "primary must be in bounds");
+        let _ = self.grid.try_place(anchor.shifted(shift), b);
+    }
+
+    fn clear_active_pair(&mut self) {
+        let PairPosition { anchor, shift } = self.active_pair;
+        assert!(self.grid.try_remove(anchor), "primary must be in bounds");
+        let _ = self.grid.try_remove(anchor.shifted(shift));
+    }
+
+    /// returns true if the puyo fell properly.
     fn fall(&mut self) -> bool {
         self.clear_active_pair();
 
@@ -232,26 +350,66 @@ impl Board {
         }
 
         self.draw_active_pair();
+
         can_fall
     }
 
-    fn draw_active_pair(&mut self) {
-        let p @ Pair([a, b]) = self.queue[0];
-        dbg!(p);
-        let PairPosition { anchor, shift } = self.active_pair;
-        self.grid
-            .set(anchor, Tile(Some(a)))
-            .expect("primary must be in bounds");
-        let _ = self.grid.set(anchor.shifted(shift), Tile(Some(b)));
+    /// attempts to rotate the puyo clockwise.
+    /// returns false if the puyo was unable to rotate.
+    fn rotate_cw(&mut self) -> bool {
+        let mut p = self.active_pair;
+
+        p.rotate_cw();
+        if self.grid.is_occupied(p.pair()) {
+            p.kickback();
+            if self.grid.is_occupied(p.anchor) {
+                return false;
+            }
+        }
+
+        self.clear_active_pair();
+        self.active_pair = p;
+        self.draw_active_pair();
+        true
     }
 
-    fn clear_active_pair(&mut self) {
-        let Pair([a, b]) = self.queue[0];
-        let PairPosition { anchor, shift } = self.active_pair;
-        self.grid
-            .set(anchor, Tile(None))
-            .expect("primary must be in bounds");
-        let _ = self.grid.set(anchor.shifted(shift), Tile(None));
+    /// modifies the combo given, and returns true if the simulation is finished.
+    fn simulate(&mut self, combo: &mut Combo) -> bool {
+        dbg!(&combo.falling);
+        for (x, y) in combo.falling.iter_mut().enumerate() {
+            if *y == -1 {
+                continue;
+            }
+            debug_assert!(y.is_positive());
+
+            let bottom = Point { x: x as i8, y: *y };
+
+            #[cfg(debug_assertions)]
+            let Some(Tile(Some(_puyo))) = self
+                .grid
+                .get(bottom)
+            else {
+                panic!("bottom puyo must be occupied. {bottom:?}");
+            };
+
+            if self.grid.try_shift(bottom) {
+                dbg!();
+                *y += 1;
+            } else {
+                todo!("land this puyo.");
+            }
+
+            todo!(
+                "
+                    figure out how to:
+                        1. land a puyo
+                        2. shift the bottom location to the next falling puyo
+                        3. wait for puyo at the bottom to settle
+                        4. pop puyos
+                        5. expand the falling locations"
+            );
+        }
+        todo!()
     }
 }
 
@@ -262,58 +420,131 @@ impl Display for Board {
             write!(f, "{pair} | ")?;
         }
         writeln!(f)?;
-        writeln!(f, "{}", self.grid)
+        write!(f, "{}", self.grid)
+    }
+}
+
+#[derive(Debug)]
+struct Combo {
+    /// the length of the combo
+    len: u8,
+    /// the accumulated score over the whole combo
+    score: u16,
+    /// tracks which columns have falling puyos, and how high up the bottommost affected puyo is.
+    /// if column is equal to height, puyos aren't falling.
+    falling: [i8; Grid::WIDTH],
+}
+
+impl Combo {
+    fn new(pair_position: PairPosition) -> Self {
+        let mut falling = [-1; Grid::WIDTH];
+
+        let PairPosition { anchor, shift } = pair_position;
+        falling[anchor.x as usize] = anchor.y;
+
+        let shifted = anchor.shifted(shift);
+        let col = &mut falling[shifted.x as usize];
+        *col = (*col).max(shifted.y);
+
+        Self {
+            len: 0,
+            score: 0,
+            falling,
+        }
+    }
+
+    fn is_still_falling(&self) -> bool {
+        self.falling.iter().any(|&y| y != -1)
+    }
+}
+
+impl Display for Combo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            len,
+            score,
+            falling: _,
+        } = self;
+        write!(f, "Combo: {len}")?;
+        if *score > 0 {
+            write!(f, "\nScore: {score}")?;
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 struct GameState {
+    board: Board,
+    combo: Option<Combo>,
     tick_time: Duration,
     rng: ThreadRng,
-    board: Board,
 }
 
 impl GameState {
     fn new(tick_time: Duration, queue_length: usize) -> Self {
         let mut rng = thread_rng();
-        // let grid = Grid(from_fn(|_| from_fn(|_| Tile(Some(Puyo::rand(&mut rng))))));
-        let board = Board::new(&mut rng, queue_length);
         Self {
+            board: Board::new(&mut rng, queue_length),
+            combo: None,
             tick_time,
             rng,
-            board,
         }
+    }
+
+    fn controllable(&self) -> bool {
+        self.combo.is_none()
     }
 }
 
 impl Default for GameState {
     fn default() -> Self {
-        Self::new(Duration::from_millis(250), 2)
+        Self::new(Duration::from_millis(500), 2)
     }
 }
 
 impl Game for GameState {
     fn key_down(&mut self, key: KeyCode) {
+        if !self.controllable() {
+            return;
+        }
+
+        self.board.rotate_cw();
         println!("down: {key:?}");
         // todo!("keyboard input")
     }
 
     fn key_up(&mut self, key: KeyCode) {
+        if !self.controllable() {
+            return;
+        }
         println!("up: {key:?}");
     }
 
     fn tick(&mut self) {
-        self.board.fall();
+        if let Some(combo) = &mut self.combo {
+            if !self.board.simulate(combo) {
+                self.combo = None;
+            }
+        } else {
+            if !self.board.fall() {
+                self.combo = Some(Combo::new(self.board.active_pair));
+            }
+        }
     }
 
     fn tick_time(&self) -> Duration {
-        self.tick_time
+        self.tick_time * if self.controllable() { 1 } else { 2 }
     }
 }
 
 impl Display for GameState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}", self.board)
+        write!(f, "{}", self.board)?;
+        if let Some(combo) = &self.combo {
+            write!(f, "\n{combo}")?;
+        }
+        Ok(())
     }
 }
 
@@ -356,7 +587,12 @@ trait Game: Display {
                 next_tick = Instant::now() + self.tick_time();
                 self.tick();
             }
-            println!("{self}");
+            execute!(
+                stdout(),
+                // Clear(ClearType::All),
+                // MoveTo(0, 0),
+                Print(&self)
+            );
         }
 
         disable_raw_mode();

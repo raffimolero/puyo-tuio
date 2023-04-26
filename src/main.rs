@@ -15,7 +15,7 @@ use std::{
 use crossterm::{
     cursor::MoveTo,
     event::{poll, read, Event, KeyCode, KeyEvent, KeyEventKind},
-    queue,
+    execute, queue,
     style::{Color, Print, SetBackgroundColor, SetForegroundColor},
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
@@ -424,6 +424,7 @@ impl Board {
 
         self.active_pair = self.queue.remove(0);
         self.queue.push(Pair::rand(rng));
+        self.draw_active_pair();
         true
     }
 
@@ -598,11 +599,10 @@ impl Game for GameState {
         };
     }
 
-    fn key_up(&mut self, key: KeyCode) {
+    fn key_up(&mut self, _key: KeyCode) {
         if !self.controllable() {
             return;
         }
-        println!("up: {key:?}");
     }
 
     fn tick(&mut self, held: &HashSet<KeyCode>) -> Duration {
@@ -691,6 +691,8 @@ trait Game: Render {
         let mut next_tick = Instant::now();
         let mut held = HashSet::new();
 
+        let mut f = stdout();
+        execute!(f, Clear(ClearType::All))?;
         enable_raw_mode()?;
         loop {
             if poll(next_tick - Instant::now())? {
@@ -718,14 +720,11 @@ trait Game: Render {
             } else {
                 next_tick = Instant::now() + self.tick(&held);
             }
-
-            let mut f = stdout();
-            queue!(f, Clear(ClearType::All), MoveTo(0, 0))?;
+            queue!(f, MoveTo(0, 0))?;
             self.queue_render()?;
             f.flush()?;
         }
         disable_raw_mode()?;
-
         Ok(())
     }
 }

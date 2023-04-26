@@ -1,7 +1,7 @@
 # puyo-tuio
 puyo puyo but in a tui
 
-refresh rate is horrible, probably only works well on windows and good terminal emulators because keyup events are actually recognized on those
+probably only works well on windows and good terminal emulators because keyup events are actually recognized on those
 
 keybinds:
 - **Q to quit (important, ctrl+C isn't programmed to work)**

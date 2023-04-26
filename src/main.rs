@@ -5,7 +5,7 @@ use std::{
     array::from_fn,
     collections::HashSet,
     fmt::Display,
-    io::stdout,
+    io::{self, stdout, Write},
     iter::repeat_with,
     mem::replace,
     ops::{Add, AddAssign},
@@ -15,14 +15,18 @@ use std::{
 use crossterm::{
     cursor::MoveTo,
     event::{poll, read, Event, KeyCode, KeyEvent, KeyEventKind},
-    execute,
-    style::Print,
+    queue,
+    style::{Color, Print, SetBackgroundColor, SetForegroundColor},
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use rand::prelude::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Color {
+trait Render {
+    fn queue_render(&self) -> io::Result<()>;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PuyoColor {
     X,
     R,
     Y,
@@ -31,26 +35,76 @@ enum Color {
     P,
 }
 
-impl Color {
-    const COLORS: [Self; 5] = [Self::R, Self::Y, Self::G, Self::B, Self::P];
-
-    fn rand(rng: &mut impl Rng) -> Self {
-        *Self::COLORS.choose(rng).unwrap()
+impl PartialEq for PuyoColor {
+    fn eq(&self, other: &Self) -> bool {
+        let a = *self as u8;
+        let b = *other as u8;
+        let x = Self::X as u8;
+        a != x && b != x && a == b
     }
 }
 
-impl Display for Color {
+impl PuyoColor {
+    const VARIANTS: [Self; 5] = [Self::R, Self::Y, Self::G, Self::B, Self::P];
+
+    // TODO: exclude one variant, depending on mood
+    fn rand(rng: &mut impl Rng) -> Self {
+        *Self::VARIANTS[..4].choose(rng).unwrap()
+    }
+}
+
+impl Display for PuyoColor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Puyo(Color);
+impl Render for PuyoColor {
+    fn queue_render(&self) -> io::Result<()> {
+        queue!(
+            stdout(),
+            SetBackgroundColor(self.into()),
+            SetForegroundColor(Color::Black),
+            Print(self),
+            SetBackgroundColor(Color::Reset),
+            SetForegroundColor(Color::Reset),
+        )
+    }
+}
+
+impl From<PuyoColor> for Color {
+    fn from(value: PuyoColor) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&PuyoColor> for Color {
+    fn from(value: &PuyoColor) -> Self {
+        match value {
+            PuyoColor::X => Self::Grey,
+            PuyoColor::R => Self::Red,
+            PuyoColor::Y => Self::Yellow,
+            PuyoColor::G => Self::Green,
+            PuyoColor::B => Self::Blue,
+            PuyoColor::P => Self::Magenta,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Puyo(PuyoColor);
 
 impl Puyo {
     fn rand(rng: &mut impl Rng) -> Self {
-        Self(Color::rand(rng))
+        Self(PuyoColor::rand(rng))
+    }
+}
+
+impl Render for Puyo {
+    fn queue_render(&self) -> io::Result<()> {
+        self.0.queue_render()?;
+        self.0.queue_render()?;
+        Ok(())
     }
 }
 
@@ -60,7 +114,7 @@ impl Display for Puyo {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Tile(Option<Puyo>);
 
 impl Tile {
@@ -73,12 +127,12 @@ impl Tile {
     }
 }
 
-impl Display for Tile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Render for Tile {
+    fn queue_render(&self) -> io::Result<()> {
         if let Some(puyo) = self.0 {
-            puyo.fmt(f)
+            puyo.queue_render()
         } else {
-            write!(f, "   ")
+            queue!(stdout(), Print("  "))
         }
     }
 }
@@ -93,15 +147,6 @@ impl Grid {
     fn new() -> Self {
         Self::default()
     }
-
-    // /// returns the previous tile state at that position.
-    // /// none if out of bounds.
-    // fn set(&mut self, Point { x, y }: Point, tile: Tile) -> Result<Tile, ()> {
-    //     if !(0..Self::WIDTH as i8).contains(&x) || !(0..Self::HEIGHT as i8).contains(&y) {
-    //         return Err(());
-    //     }
-    //     Ok(std::mem::replace(&mut self.0[y as usize][x as usize], tile))
-    // }
 
     /// checks if a point is in bounds.
     fn point_in_bounds(Point { x, y }: Point) -> bool {
@@ -208,17 +253,19 @@ impl Default for Grid {
     }
 }
 
-impl Display for Grid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "+{}+", "-".repeat(Self::WIDTH * 3))?;
+impl Render for Grid {
+    fn queue_render(&self) -> io::Result<()> {
+        let mut f = stdout();
+        let bar = format!("+{}+", "-".repeat(Self::WIDTH * 2));
+        queue!(f, Print(&bar), Print("\n"))?;
         for row in &self.0 {
-            write!(f, "|")?;
+            queue!(f, Print("|"))?;
             for tile in row {
-                write!(f, "{tile}")?;
+                tile.queue_render()?;
             }
-            writeln!(f, "|")?;
+            queue!(f, Print("|\n"))?;
         }
-        write!(f, "+{}+", "-".repeat(Self::WIDTH * 3))?;
+        queue!(f, Print(bar))?;
         Ok(())
     }
 }
@@ -232,10 +279,10 @@ impl Pair {
     }
 }
 
-impl Display for Pair {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Render for Pair {
+    fn queue_render(&self) -> io::Result<()> {
         for puyo in self.0 {
-            write!(f, "{puyo}")?;
+            puyo.queue_render()?;
         }
         Ok(())
     }
@@ -435,44 +482,49 @@ impl Board {
             combo.pop(count as u32);
         });
         if popped {
-            combo.len += 1;
+            combo.length += 1;
         }
         popped
     }
 }
 
-impl Display for Board {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "QUEUE: ")?;
+impl Render for Board {
+    fn queue_render(&self) -> io::Result<()> {
+        let mut f = stdout();
+        queue!(f, Print("QUEUE: "))?;
         for pair in &self.queue {
-            write!(f, "{pair} | ")?;
+            pair.queue_render()?;
+            queue!(f, Print(" | "))?;
         }
-        writeln!(f)?;
-        write!(f, "{}", self.grid)
+        queue!(f, Print("\n"))?;
+        self.grid.queue_render()
     }
 }
 
 #[derive(Debug)]
 struct Combo {
     /// the length of the combo
-    len: u32,
+    length: u32,
     /// the accumulated score over the whole combo
     score: u32,
 }
 
 impl Combo {
     fn new() -> Self {
-        Self { len: 0, score: 0 }
+        Self {
+            length: 0,
+            score: 0,
+        }
     }
 
     fn pop(&mut self, count: u32) {
-        self.score += self.len * count;
+        self.score += (self.length + 1) * count;
     }
 }
 
 impl Display for Combo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { len, score } = self;
+        let Self { length: len, score } = self;
         write!(f, "Combo: {len}")?;
         if *score > 0 {
             write!(f, "\nScore: {score}")?;
@@ -553,37 +605,69 @@ impl Game for GameState {
         println!("up: {key:?}");
     }
 
-    fn tick(&mut self) -> Duration {
-        if self.dead {
-            return self.tick_time * 5;
+    fn tick(&mut self, held: &HashSet<KeyCode>) -> Duration {
+        let mut tick_time = self.tick_time;
+        if held.contains(&KeyCode::Char('k')) {
+            tick_time /= 4;
         }
+
+        if self.dead {
+            return tick_time * 5;
+        }
+
         if let Some(combo) = &mut self.combo {
-            if !self.board.gravity() && !self.board.pop(combo) {
-                self.end_combo();
+            if !self.board.gravity() {
+                tick_time *= 2;
+                if !self.board.pop(combo) {
+                    self.end_combo();
+                }
+            } else {
+                tick_time /= 2
             }
         } else {
             if !self.board.shift(Direction::D) {
                 self.begin_combo();
             }
         }
-        self.tick_time / if self.controllable() { 1 } else { 2 }
+
+        tick_time
     }
 }
 
-impl Display for GameState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.board)?;
+impl Render for GameState {
+    fn queue_render(&self) -> io::Result<()> {
+        let mut f = stdout();
+        queue!(f, Print(self.score), Print("\n"))?;
+        self.board.queue_render()?;
         if let Some(combo) = &self.combo {
-            write!(f, "\n{combo}")?;
+            queue!(f, Print("\n"), Print(combo))?;
         }
         if self.dead {
-            write!(f, "\nGAME OVER!")?;
+            queue!(f, Print("\nGAME OVER!"))?;
         }
         Ok(())
     }
 }
 
-trait Game: Display {
+#[derive(Debug)]
+enum ErrorKind {
+    Crossterm(crossterm::ErrorKind),
+    Io(io::ErrorKind),
+}
+
+impl From<crossterm::ErrorKind> for ErrorKind {
+    fn from(value: crossterm::ErrorKind) -> Self {
+        Self::Crossterm(value)
+    }
+}
+
+impl From<io::ErrorKind> for ErrorKind {
+    fn from(value: io::ErrorKind) -> Self {
+        Self::Io(value)
+    }
+}
+
+trait Game: Render {
     /// called when the user presses a key.
     fn key_down(&mut self, key: KeyCode) {
         println!("Pressed {key:?}");
@@ -596,13 +680,14 @@ trait Game: Display {
     }
 
     /// returns how long the game should wait before the next frame.
-    fn tick(&mut self) -> Duration {
+    fn tick(&mut self, held: &HashSet<KeyCode>) -> Duration {
         println!("Tick!");
+        println!("Held keys: {held:?}");
         Duration::from_secs(1)
     }
 
     /// runs the game.
-    fn run(&mut self) -> crossterm::Result<()> {
+    fn run(&mut self) -> Result<(), ErrorKind> {
         let mut next_tick = Instant::now();
         let mut held = HashSet::new();
 
@@ -631,15 +716,13 @@ trait Game: Display {
                     }
                 }
             } else {
-                next_tick = Instant::now() + self.tick();
+                next_tick = Instant::now() + self.tick(&held);
             }
-            execute!(
-                stdout(),
-                //
-                Clear(ClearType::All),
-                MoveTo(0, 0),
-                Print(&self),
-            )?;
+
+            let mut f = stdout();
+            queue!(f, Clear(ClearType::All), MoveTo(0, 0))?;
+            self.queue_render()?;
+            f.flush()?;
         }
         disable_raw_mode()?;
 

@@ -3,10 +3,12 @@
 
 use std::{
     array::from_fn,
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     fmt::Display,
     io::stdout,
     iter::repeat_with,
+    mem::replace,
+    ops::{Add, AddAssign},
     time::{Duration, Instant},
 };
 
@@ -156,6 +158,48 @@ impl Grid {
         assert!(self.try_place(slot, puyo));
         true
     }
+
+    fn pop(&mut self, mut pop: impl FnMut(usize)) {
+        let mut checked = [[false; Self::WIDTH]; Self::HEIGHT];
+        let mut queue = vec![];
+        let mut chain = vec![];
+        for y in 0..Self::HEIGHT {
+            for x in 0..Self::WIDTH {
+                let Some(puyo) = self.0[y][x].0 else {
+                    continue;
+                };
+                queue.push((x, y));
+                while let Some(p @ (x, y)) = queue.pop() {
+                    if self.0[y][x].0 != Some(puyo) {
+                        continue;
+                    };
+                    if replace(&mut checked[y][x], true) {
+                        continue;
+                    }
+                    chain.push(p);
+                    if x > 0 {
+                        queue.push((x - 1, y));
+                    }
+                    if x + 1 < Self::WIDTH {
+                        queue.push((x + 1, y));
+                    }
+                    if y > 0 {
+                        queue.push((x, y - 1));
+                    }
+                    if y + 1 < Self::HEIGHT {
+                        queue.push((x, y + 1));
+                    }
+                }
+                if chain.len() >= 4 {
+                    pop(chain.len());
+                    for (x, y) in chain.iter().copied() {
+                        self.0[y][x] = Tile(None);
+                    }
+                }
+                chain.clear();
+            }
+        }
+    }
 }
 
 impl Default for Grid {
@@ -198,6 +242,14 @@ impl Display for Pair {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rotation {
+    N,
+    CW,
+    U,
+    CC,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     U,
     R,
@@ -205,32 +257,23 @@ enum Direction {
     L,
 }
 
-impl Direction {
-    fn rotated_cw(self) -> Self {
-        match self {
-            Direction::U => Direction::R,
-            Direction::R => Direction::D,
-            Direction::D => Direction::L,
-            Direction::L => Direction::U,
+impl Add<Rotation> for Direction {
+    type Output = Self;
+
+    fn add(self, rhs: Rotation) -> Self::Output {
+        match (self as u8 + rhs as u8) % 4 {
+            0 => Self::U,
+            1 => Self::R,
+            2 => Self::D,
+            3 => Self::L,
+            _ => unreachable!(),
         }
     }
+}
 
-    fn rotated_cc(self) -> Self {
-        match self {
-            Direction::U => Direction::L,
-            Direction::R => Direction::U,
-            Direction::D => Direction::R,
-            Direction::L => Direction::D,
-        }
-    }
-
-    fn rotated_180(self) -> Self {
-        match self {
-            Direction::U => Direction::D,
-            Direction::R => Direction::L,
-            Direction::D => Direction::U,
-            Direction::L => Direction::R,
-        }
+impl AddAssign<Rotation> for Direction {
+    fn add_assign(&mut self, rhs: Rotation) {
+        *self = *self + rhs;
     }
 }
 
@@ -263,16 +306,12 @@ impl PairPosition {
         self.anchor.shifted(self.shift)
     }
 
-    fn rotate_cw(&mut self) {
-        self.shift = self.shift.rotated_cw();
-    }
-
-    fn rotate_cc(&mut self) {
-        self.shift = self.shift.rotated_cc();
+    fn rotate(&mut self, rotation: Rotation) {
+        self.shift += rotation;
     }
 
     fn kickback(&mut self) {
-        self.anchor = self.anchor.shifted(self.shift.rotated_180())
+        self.anchor = self.anchor.shifted(self.shift + Rotation::U)
     }
 }
 
@@ -293,8 +332,9 @@ impl Default for PairPosition {
 
 #[derive(Debug)]
 struct Board {
+    active_pair: Pair,
     queue: Vec<Pair>,
-    active_pair: PairPosition,
+    pair_position: PairPosition,
     grid: Grid,
 }
 
@@ -302,8 +342,9 @@ impl Board {
     fn new(rng: &mut impl Rng, queue_length: usize) -> Self {
         let mut randomizer = repeat_with(|| Pair::rand(rng));
         let mut this = Self {
+            active_pair: randomizer.next().unwrap(),
             queue: randomizer.take(queue_length).collect(),
-            active_pair: PairPosition::default(),
+            pair_position: PairPosition::default(),
             grid: Grid::new(),
         };
         this.draw_active_pair();
@@ -311,42 +352,56 @@ impl Board {
     }
 
     fn draw_active_pair(&mut self) {
-        let Pair([a, b]) = self.queue[0];
-        let PairPosition { anchor, shift } = self.active_pair;
+        let Pair([a, b]) = self.active_pair;
+        let PairPosition { anchor, shift } = self.pair_position;
         assert!(self.grid.try_place(anchor, a), "primary must be in bounds");
         let _ = self.grid.try_place(anchor.shifted(shift), b);
     }
 
     fn clear_active_pair(&mut self) {
-        let PairPosition { anchor, shift } = self.active_pair;
+        let PairPosition { anchor, shift } = self.pair_position;
         self.grid
             .try_remove(anchor)
             .expect("primary must be in bounds");
         let _ = self.grid.try_remove(anchor.shifted(shift));
     }
 
-    /// returns true if the puyo fell and wasn't blocked.
-    fn soft_drop(&mut self) -> bool {
-        let PairPosition { anchor, shift } = self.active_pair;
-        let shifted = anchor.shifted(Direction::D);
+    /// attempts to spawn the next puyo pair.
+    /// returns false if it was blocked.
+    #[must_use]
+    fn try_spawn_next_pair(&mut self, rng: &mut impl Rng) -> bool {
+        self.pair_position = PairPosition::default();
+        if self.grid.is_occupied(self.pair_position.anchor) {
+            return false;
+        }
 
+        self.active_pair = self.queue.remove(0);
+        self.queue.push(Pair::rand(rng));
+        true
+    }
+
+    /// returns true if the puyo fell and wasn't blocked.
+    fn shift(&mut self, direction: Direction) -> bool {
+        let PairPosition { anchor, shift } = self.pair_position;
+        let shifted = anchor.shifted(direction);
+
+        self.clear_active_pair();
         let can_fall = self.grid.is_free(shifted) && self.grid.is_free(shifted.shifted(shift));
 
         if can_fall {
-            self.clear_active_pair();
-            self.active_pair.anchor = shifted;
-            self.draw_active_pair();
+            self.pair_position.anchor = shifted;
         }
 
+        self.draw_active_pair();
         can_fall
     }
 
     /// attempts to rotate the puyo clockwise.
     /// returns false if the puyo was unable to rotate.
-    fn rotate_cw(&mut self) -> bool {
-        let mut p = self.active_pair;
+    fn rotate(&mut self, rotation: Rotation) -> bool {
+        let mut p = self.pair_position;
 
-        p.rotate_cw();
+        p.rotate(rotation);
         if self.grid.is_occupied(p.pair()) {
             p.kickback();
             if self.grid.is_occupied(p.anchor) {
@@ -355,12 +410,13 @@ impl Board {
         }
 
         self.clear_active_pair();
-        self.active_pair = p;
+        self.pair_position = p;
         self.draw_active_pair();
         true
     }
 
-    /// modifies the combo given, and returns false if the simulation is finished.
+    /// makes all floating puyos fall.
+    /// returns false if none fell.
     fn gravity(&mut self) -> bool {
         let mut fell = false;
         for y in (0..Grid::HEIGHT as i8).rev() {
@@ -371,13 +427,17 @@ impl Board {
         fell
     }
 
-    fn pop(&mut self, combo: &mut Combo) {
-        // todo!(
-        //     "
-        //     figure out how to:
-        //         4. pop puyos
-        //         5. expand the falling locations"
-        // );
+    /// returns whether any puyos were popped at all.
+    fn pop(&mut self, combo: &mut Combo) -> bool {
+        let mut popped = false;
+        self.grid.pop(|count| {
+            popped = true;
+            combo.pop(count as u32);
+        });
+        if popped {
+            combo.len += 1;
+        }
+        popped
     }
 }
 
@@ -395,23 +455,18 @@ impl Display for Board {
 #[derive(Debug)]
 struct Combo {
     /// the length of the combo
-    len: u8,
+    len: u32,
     /// the accumulated score over the whole combo
-    score: u16,
+    score: u32,
 }
 
 impl Combo {
-    fn new(pair_position: PairPosition) -> Self {
-        let mut falling = [-1; Grid::WIDTH];
-
-        let PairPosition { anchor, shift } = pair_position;
-        falling[anchor.x as usize] = anchor.y;
-
-        let shifted = anchor.shifted(shift);
-        let col = &mut falling[shifted.x as usize];
-        *col = (*col).max(shifted.y);
-
+    fn new() -> Self {
         Self { len: 0, score: 0 }
+    }
+
+    fn pop(&mut self, count: u32) {
+        self.score += self.len * count;
     }
 }
 
@@ -428,7 +483,9 @@ impl Display for Combo {
 
 #[derive(Debug)]
 struct GameState {
+    dead: bool,
     board: Board,
+    score: u32,
     combo: Option<Combo>,
     tick_time: Duration,
     rng: ThreadRng,
@@ -438,7 +495,9 @@ impl GameState {
     fn new(tick_time: Duration, queue_length: usize) -> Self {
         let mut rng = thread_rng();
         Self {
+            dead: false,
             board: Board::new(&mut rng, queue_length),
+            score: 0,
             combo: None,
             tick_time,
             rng,
@@ -448,11 +507,26 @@ impl GameState {
     fn controllable(&self) -> bool {
         self.combo.is_none()
     }
+
+    fn begin_combo(&mut self) {
+        self.combo = Some(Combo::new());
+    }
+
+    /// ends the combo and spawns the next puyo pair.
+    /// may end the game.
+    fn end_combo(&mut self) {
+        self.score += self
+            .combo
+            .take()
+            .expect("attempted to end nonexistent combo")
+            .score;
+        self.dead = !self.board.try_spawn_next_pair(&mut self.rng);
+    }
 }
 
 impl Default for GameState {
     fn default() -> Self {
-        Self::new(Duration::from_millis(500), 2)
+        Self::new(Duration::from_millis(250), 2)
     }
 }
 
@@ -462,9 +536,14 @@ impl Game for GameState {
             return;
         }
 
-        self.board.rotate_cw();
-        println!("down: {key:?}");
-        // todo!("keyboard input")
+        match key {
+            KeyCode::Char('j') => self.board.shift(Direction::L),
+            KeyCode::Char('l') => self.board.shift(Direction::R),
+            KeyCode::Char('k') => self.board.shift(Direction::D),
+            KeyCode::Char('s') => self.board.rotate(Rotation::CC),
+            KeyCode::Char('f') => self.board.rotate(Rotation::CW),
+            _ => false, // TODO: do something with the return values lmao
+        };
     }
 
     fn key_up(&mut self, key: KeyCode) {
@@ -474,19 +553,19 @@ impl Game for GameState {
         println!("up: {key:?}");
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self) -> Duration {
+        if self.dead {
+            return self.tick_time * 5;
+        }
         if let Some(combo) = &mut self.combo {
-            if !self.board.gravity() {
-                self.board.pop(combo);
+            if !self.board.gravity() && !self.board.pop(combo) {
+                self.end_combo();
             }
         } else {
-            if !self.board.soft_drop() {
-                self.combo = Some(Combo::new(self.board.active_pair));
+            if !self.board.shift(Direction::D) {
+                self.begin_combo();
             }
         }
-    }
-
-    fn tick_time(&self) -> Duration {
         self.tick_time / if self.controllable() { 1 } else { 2 }
     }
 }
@@ -497,22 +576,37 @@ impl Display for GameState {
         if let Some(combo) = &self.combo {
             write!(f, "\n{combo}")?;
         }
+        if self.dead {
+            write!(f, "\nGAME OVER!")?;
+        }
         Ok(())
     }
 }
 
 trait Game: Display {
-    fn key_down(&mut self, key: KeyCode) {}
-    fn key_up(&mut self, key: KeyCode) {}
-    fn tick(&mut self) {}
+    /// called when the user presses a key.
+    fn key_down(&mut self, key: KeyCode) {
+        println!("Pressed {key:?}");
+    }
 
-    fn tick_time(&self) -> Duration;
+    /// called when the user releases a key.
+    /// hopefully.
+    fn key_up(&mut self, key: KeyCode) {
+        println!("Released {key:?}");
+    }
 
+    /// returns how long the game should wait before the next frame.
+    fn tick(&mut self) -> Duration {
+        println!("Tick!");
+        Duration::from_secs(1)
+    }
+
+    /// runs the game.
     fn run(&mut self) -> crossterm::Result<()> {
         let mut next_tick = Instant::now();
         let mut held = HashSet::new();
 
-        enable_raw_mode();
+        enable_raw_mode()?;
         loop {
             if poll(next_tick - Instant::now())? {
                 let event = read()?;
@@ -537,8 +631,7 @@ trait Game: Display {
                     }
                 }
             } else {
-                self.tick();
-                next_tick = Instant::now() + self.tick_time();
+                next_tick = Instant::now() + self.tick();
             }
             execute!(
                 stdout(),
@@ -546,14 +639,14 @@ trait Game: Display {
                 Clear(ClearType::All),
                 MoveTo(0, 0),
                 Print(&self),
-            );
+            )?;
         }
+        disable_raw_mode()?;
 
-        disable_raw_mode();
         Ok(())
     }
 }
 
 fn main() {
-    GameState::default().run();
+    GameState::default().run().unwrap();
 }
